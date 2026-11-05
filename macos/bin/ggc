@@ -1,0 +1,371 @@
+#!/usr/bin/env bash
+#
+# ggc — "git garbage collect"
+#
+# Prunes local branches whose GitHub PR has been merged or closed.
+#
+#   PR open                        -> keep
+#   on GitHub, no PR               -> keep (with -o: delete locally AND on GitHub)
+#   local only (not on GitHub)     -> keep (with -l: delete locally)
+#   PR merged or closed            -> offer to delete locally (git branch -D)
+#
+# The repo's default branch and branches checked out in a worktree are never
+# offered. Requires git and an authenticated gh (GitHub CLI).
+#
+# Written for the bash 3.2 that ships with macOS: no associative arrays or mapfile.
+
+set -euo pipefail
+
+REMOTE="${GGC_REMOTE:-origin}"
+CHUNK=50   # branches per GitHub GraphQL request
+
+usage() {
+  cat <<EOF
+Usage: ggc [options]
+
+Prune local branches whose GitHub PR is merged or closed.
+
+Options:
+  -b, --bulk      confirm once for all prunable branches (default: one at a time)
+  -o, --orphans   also prune branches that are on GitHub but have no PR;
+                  these are deleted locally AND on GitHub
+  -l, --local-only
+                  also prune branches that aren't on GitHub and have no PR
+  -n, --dry-run   show what would be pruned, delete nothing
+  -h, --help      show this help
+
+Short flags can be combined, e.g. ggc -bo
+
+Environment:
+  GGC_REMOTE      remote to check against (default: origin)
+EOF
+}
+
+if [[ -t 1 ]]; then
+  BOLD=$'\033[1m' DIM=$'\033[2m' RED=$'\033[31m' GREEN=$'\033[32m'
+  YELLOW=$'\033[33m' CYAN=$'\033[36m' MAGENTA=$'\033[35m' RESET=$'\033[0m'
+else
+  BOLD='' DIM='' RED='' GREEN='' YELLOW='' CYAN='' MAGENTA='' RESET=''
+fi
+
+die() { printf '%sggc:%s %s\n' "$RED" "$RESET" "$*" >&2; exit 1; }
+
+BULK=0
+DRY_RUN=0
+ORPHANS=0
+LOCAL_ONLY=0
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -b|--bulk)    BULK=1 ;;
+    -o|--orphans) ORPHANS=1 ;;
+    -l|--local-only) LOCAL_ONLY=1 ;;
+    -n|--dry-run) DRY_RUN=1 ;;
+    -h|--help)    usage; exit 0 ;;
+    -[!-]?*)      # combined short flags: -bo -> -b -o
+                  flags=${1#-}; shift
+                  set -- $(printf '%s' "$flags" | sed 's/./-& /g') ${@+"$@"}
+                  continue ;;
+    *)            die "unknown option: $1 (see ggc --help)" ;;
+  esac
+  shift
+done
+
+# --- preflight ---------------------------------------------------------------
+
+command -v gh >/dev/null 2>&1 || die "gh (GitHub CLI) is required: https://cli.github.com"
+git rev-parse --git-dir >/dev/null 2>&1 || die "not inside a git repository"
+remote_url=$(git remote get-url "$REMOTE" 2>/dev/null) \
+  || die "no '$REMOTE' remote (set GGC_REMOTE to use another)"
+
+# owner/name from git@github.com:owner/name.git or https://github.com/owner/name(.git)
+repo_path=${remote_url%/}
+repo_path=${repo_path%.git}
+repo_name=${repo_path##*/}
+repo_rest=${repo_path%/*}
+repo_owner=${repo_rest##*[/:]}
+[[ -n $repo_owner && -n $repo_name ]] || die "can't parse owner/repo from $REMOTE URL: $remote_url"
+repo_owner_lc=$(printf '%s' "$repo_owner" | tr '[:upper:]' '[:lower:]')
+
+default_branch=$(gh repo view "$repo_owner/$repo_name" --json defaultBranchRef --jq .defaultBranchRef.name) \
+  || die "couldn't look up $repo_owner/$repo_name on GitHub (is gh authenticated?)"
+
+branches=()
+while IFS= read -r ref; do
+  branches+=("${ref#refs/heads/}")
+done < <(git for-each-ref --format='%(refname)' refs/heads/)
+n=${#branches[@]}
+[[ $n -gt 0 ]] || { echo "No local branches."; exit 0; }
+
+current_branch=$(git symbolic-ref --quiet --short HEAD 2>/dev/null || true)
+worktree_branches=$(git worktree list --porcelain | sed -n 's|^branch refs/heads/||p')
+remote_heads=$(git ls-remote --heads "$REMOTE") || die "couldn't reach remote '$REMOTE'"
+remote_branches=$(printf '%s\n' "$remote_heads" | sed -n 's|^[0-9a-f]*[[:space:]]*refs/heads/||p')
+
+in_list() { grep -Fxq -- "$1" <<<"$2"; }
+remote_sha() { awk -v r="refs/heads/$1" '$2 == r { print $1; exit }' <<<"$remote_heads"; }
+
+# --- look up PRs (one GraphQL request per $CHUNK branches) -------------------
+
+# For each branch: prefer an open PR, else the most recently created one. Only
+# PRs whose head lives in this repo count (ignores same-named branches on forks).
+JQ='.data.repository | to_entries[] | .key as $k
+  | [.value.nodes[] | select((.headRepositoryOwner.login // "" | ascii_downcase) == "'"$repo_owner_lc"'")] as $prs
+  | (([$prs[] | select(.state == "OPEN")] | first) // ($prs | first)) as $p
+  | if $p == null then [$k, "NONE", "-", "-", "-"]
+    else [$k, $p.state, ($p.number | tostring), $p.url, $p.headRefOid] end
+  | join("\t")'
+
+pr_state=() pr_num=() pr_url=() pr_oid=()
+printf '%sChecking %d local branches against %s/%s…%s\n' "$DIM" "$n" "$repo_owner" "$repo_name" "$RESET"
+
+for ((start = 0; start < n; start += CHUNK)); do
+  var_defs='' fields='' args=()
+  for ((i = start; i < n && i < start + CHUNK; i++)); do
+    var_defs+=", \$b$i: String!"
+    fields+=" b$i: pullRequests(headRefName: \$b$i, first: 20, orderBy: {field: CREATED_AT, direction: DESC}) { nodes { number state url headRefOid headRepositoryOwner { login } } }"
+    args+=(-f "b$i=${branches[i]}")
+  done
+  query="query(\$owner: String!, \$name: String!$var_defs) { repository(owner: \$owner, name: \$name) {$fields } }"
+
+  out=$(gh api graphql -f query="$query" -f owner="$repo_owner" -f name="$repo_name" "${args[@]}" --jq "$JQ") \
+    || die "GitHub PR lookup failed"
+
+  while IFS=$'\t' read -r key state num url oid; do
+    [[ -n $key ]] || continue
+    i=${key#b}
+    pr_state[i]=$state pr_num[i]=$num pr_url[i]=$url pr_oid[i]=$oid
+  done <<<"$out"
+done
+
+# --- classify ----------------------------------------------------------------
+
+width=0
+for b in "${branches[@]}"; do [[ ${#b} -gt $width ]] && width=${#b}; done
+[[ $width -gt 48 ]] && width=48
+
+row() { printf '  %-*s  %s\n' "$width" "$1" "$2"; }
+
+candidates=()   # indexes into branches
+kind=()         # per candidate: "pr" (merged/closed PR) or "orphan" (on GitHub, no PR)
+rsha=()         # per orphan: the branch's sha on GitHub
+labels=()       # per-index status text
+warns=()        # per-index warning text for candidates
+
+for ((i = 0; i < n; i++)); do
+  b=${branches[i]}
+  state=${pr_state[i]:-NONE}
+  num=${pr_num[i]:-}
+
+  blocker=''
+  if [[ $b == "$default_branch" ]]; then
+    blocker="default branch, keeping"
+  elif [[ $b == "$current_branch" ]]; then
+    blocker="checked out here — switch branches to prune it"
+  elif in_list "$b" "$worktree_branches"; then
+    blocker="checked out in another worktree — 'git worktree remove' it first"
+  fi
+
+  if [[ $state == OPEN ]]; then
+    labels[i]="${GREEN}open${RESET} #$num"
+  elif [[ $state == MERGED || $state == CLOSED ]]; then
+    if [[ $state == MERGED ]]; then label="${MAGENTA}merged${RESET} #$num"; else label="${RED}closed${RESET} #$num"; fi
+    if [[ -n $blocker ]]; then
+      labels[i]="$label ${DIM}($blocker)${RESET}"
+    else
+      labels[i]="$label ${YELLOW}← prunable${RESET}"
+      candidates+=("$i") kind[i]=pr
+    fi
+  elif in_list "$b" "$remote_branches"; then
+    if [[ $ORPHANS -eq 0 ]]; then
+      labels[i]="${DIM}on GitHub, no PR${RESET}"
+    elif [[ -n $blocker ]]; then
+      labels[i]="${DIM}on GitHub, no PR ($blocker)${RESET}"
+    else
+      labels[i]="${CYAN}on GitHub, no PR${RESET} ${YELLOW}← prunable (local + GitHub)${RESET}"
+      candidates+=("$i") kind[i]=orphan rsha[i]=$(remote_sha "$b")
+    fi
+  elif [[ $LOCAL_ONLY -eq 0 ]]; then
+    labels[i]="${DIM}local only${RESET}"
+  elif [[ -n $blocker ]]; then
+    labels[i]="${DIM}local only ($blocker)${RESET}"
+  else
+    labels[i]="${CYAN}local only${RESET} ${DIM}($(git log -1 --format=%cr "refs/heads/$b"))${RESET} ${YELLOW}← prunable${RESET}"
+    candidates+=("$i") kind[i]=local
+  fi
+done
+
+# Each candidate is compared against a commit from GitHub: the PR's final head
+# (merged/closed) or the branch tip (orphans). That commit is often not local
+# yet, so fetch any missing ones in one go before comparing.
+target_sha() { if [[ ${kind[$1]} == pr ]]; then echo "${pr_oid[$1]}"; else echo "${rsha[$1]}"; fi; }
+
+missing=()
+for i in ${candidates[@]+"${candidates[@]}"}; do
+  [[ ${kind[i]} != local ]] || continue
+  sha=$(target_sha "$i")
+  if [[ $(git rev-parse "refs/heads/${branches[i]}") != "$sha" ]] && ! git cat-file -e "$sha^{commit}" 2>/dev/null; then
+    if [[ ${kind[i]} == pr ]]; then missing+=("refs/pull/${pr_num[i]}/head"); else missing+=("refs/heads/${branches[i]}"); fi
+  fi
+done
+if [[ ${#missing[@]} -gt 0 ]]; then
+  printf '%sFetching %d commit(s) from GitHub to check for unpushed work…%s\n' "$DIM" "${#missing[@]}" "$RESET"
+  git fetch --quiet --no-tags --no-write-fetch-head "$REMOTE" "${missing[@]}" 2>/dev/null || true
+fi
+
+# Merged/closed PRs only get a warning (the GitHub side is already settled).
+# Orphans are deleted on GitHub too, so one whose GitHub copy has commits you
+# don't have locally (possibly someone else's work) is skipped, not offered.
+kept=()
+for i in ${candidates[@]+"${candidates[@]}"}; do
+  if [[ ${kind[i]} == local ]]; then
+    unique=$(git rev-list --count "refs/heads/${branches[i]}" --not --remotes)
+    warns[i]=''
+    [[ $unique -eq 0 ]] || warns[i]="$unique commit(s) not on GitHub"
+    [[ -z ${warns[i]} ]] || labels[i]="${labels[i]} ${RED}⚠ ${warns[i]}${RESET}"
+    kept+=("$i")
+    continue
+  fi
+  local_sha=$(git rev-parse "refs/heads/${branches[i]}")
+  sha=$(target_sha "$i")
+  warn='' skip=''
+  if [[ $local_sha == "$sha" ]]; then
+    :
+  elif ! git cat-file -e "$sha^{commit}" 2>/dev/null; then
+    if [[ ${kind[i]} == pr ]]; then
+      warn="couldn't fetch the PR head to check for unpushed commits"
+    else
+      skip="couldn't fetch it from GitHub to compare"
+    fi
+  else
+    ahead=$(git rev-list --count "$sha..$local_sha")
+    behind=$(git rev-list --count "$local_sha..$sha")
+    if [[ ${kind[i]} == pr ]]; then
+      [[ $ahead -eq 0 ]] || warn="$ahead local commit(s) not in the PR"
+    elif [[ $behind -gt 0 ]]; then
+      skip="GitHub has $behind commit(s) you don't have locally"
+    else
+      [[ $ahead -eq 0 ]] || warn="$ahead local commit(s) not pushed — they'll be lost"
+    fi
+  fi
+  if [[ -n $skip ]]; then
+    labels[i]="${DIM}on GitHub, no PR${RESET} ${RED}(skipped: $skip)${RESET}"
+    continue
+  fi
+  kept+=("$i")
+  warns[i]=$warn
+  [[ -z $warn ]] || labels[i]="${labels[i]} ${RED}⚠ $warn${RESET}"
+done
+candidates=(${kept[@]+"${kept[@]}"})
+
+echo
+for ((i = 0; i < n; i++)); do row "${branches[i]}" "${labels[i]}"; done
+echo
+
+nc=${#candidates[@]}
+if [[ $nc -eq 0 ]]; then
+  echo "Nothing to prune."
+  exit 0
+fi
+
+norphans=0 nwarn=0
+for i in "${candidates[@]}"; do
+  [[ ${kind[i]} != orphan ]] || norphans=$((norphans + 1))
+  [[ -z ${warns[i]:-} ]] || nwarn=$((nwarn + 1))
+done
+also_gh=''
+[[ $norphans -eq 0 ]] || also_gh=" ($norphans also deleted on GitHub)"
+
+if [[ $DRY_RUN -eq 1 ]]; then
+  echo "${BOLD}$nc${RESET} branch(es) would be offered for pruning${also_gh}. (dry run — nothing deleted)"
+  exit 0
+fi
+
+# --- prune -------------------------------------------------------------------
+
+ask() {  # ask "prompt" -> echoes the lowercased answer
+  local ans=''
+  printf '%s' "$1" >/dev/tty
+  IFS= read -r ans </dev/tty || true
+  printf '%s' "$ans" | tr '[:upper:]' '[:lower:]'
+}
+
+deleted=0 deleted_gh=0 failed=0
+delete_local() {
+  if git branch -D -- "$1"; then
+    deleted=$((deleted + 1))
+  else
+    failed=$((failed + 1))
+  fi
+}
+
+# delete_on_github <index>... — deletes those branches on GitHub in one push.
+# --force-with-lease makes each delete fail if the branch moved since we looked.
+# Sets $gh_deleted to the names that were actually deleted.
+delete_on_github() {
+  local i b leases=() refspecs=() out
+  for i in "$@"; do
+    b=${branches[i]}
+    leases+=("--force-with-lease=refs/heads/$b:${rsha[i]}")
+    refspecs+=(":refs/heads/$b")
+  done
+  out=$(git push --porcelain "$REMOTE" "${leases[@]}" "${refspecs[@]}") || true
+  gh_deleted=$(printf '%s\n' "$out" | awk -F'\t' '$1 == "-" && $2 ~ /^:refs\/heads\// { sub(/^:refs\/heads\//, "", $2); print $2 }')
+}
+
+# prune <index>... — orphans are deleted on GitHub first; their local branch is
+# only deleted if that worked, so nothing is ever left half-pruned.
+prune() {
+  local i orphans=() gh_deleted=''
+  for i in "$@"; do [[ ${kind[i]} != orphan ]] || orphans+=("$i"); done
+  [[ ${#orphans[@]} -eq 0 ]] || delete_on_github "${orphans[@]}"
+  for i in "$@"; do
+    b=${branches[i]}
+    if [[ ${kind[i]} == orphan ]]; then
+      if in_list "$b" "$gh_deleted"; then
+        echo "Deleted $REMOTE/$b on GitHub."
+        deleted_gh=$((deleted_gh + 1))
+      else
+        echo "${RED}Couldn't delete $REMOTE/$b on GitHub; kept the local branch.${RESET}"
+        failed=$((failed + 1))
+        continue
+      fi
+    fi
+    delete_local "$b"
+  done
+}
+
+if [[ $BULK -eq 1 ]]; then
+  [[ $nwarn -eq 0 ]] || echo "${RED}⚠ $nwarn of these have a warning above.${RESET}"
+  ans=$(ask "Delete all ${BOLD}$nc${RESET} prunable branch(es) listed above${also_gh}? [y/N] ")
+  if [[ $ans == y || $ans == yes ]]; then
+    prune "${candidates[@]}"
+  fi
+else
+  for i in "${candidates[@]}"; do
+    b=${branches[i]}
+    if [[ ${kind[i]} == pr ]]; then
+      state=$(printf '%s' "${pr_state[i]}" | tr '[:upper:]' '[:lower:]')
+      printf '%s%s%s  %s #%s  %s%s%s\n' "$BOLD" "$b" "$RESET" "$state" "${pr_num[i]}" "$CYAN" "${pr_url[i]}" "$RESET"
+      question="Delete local branch?"
+    elif [[ ${kind[i]} == local ]]; then
+      printf '%s%s%s  local only, last commit %s\n' "$BOLD" "$b" "$RESET" "$(git log -1 --format='%cr: %s' "refs/heads/$b")"
+      question="Delete local branch?"
+    else
+      printf '%s%s%s  no PR  %shttps://github.com/%s/%s/tree/%s%s\n' "$BOLD" "$b" "$RESET" "$CYAN" "$repo_owner" "$repo_name" "$b" "$RESET"
+      question="Delete local branch ${BOLD}and${RESET} $REMOTE/$b on GitHub?"
+    fi
+    [[ -n ${warns[i]:-} ]] && printf '  %s⚠ %s%s\n' "$RED" "${warns[i]}" "$RESET"
+    ans=$(ask "  $question [y/N/q] ")
+    case $ans in
+      y|yes) prune "$i" ;;
+      q|quit) break ;;
+      *) echo "  ${DIM}kept${RESET}" ;;
+    esac
+  done
+fi
+
+echo
+summary="Deleted $deleted of $nc prunable branch(es)"
+[[ $deleted_gh -eq 0 ]] || summary+=" ($deleted_gh also deleted on GitHub)"
+echo "$summary."
+[[ $failed -eq 0 ]] || echo "${RED}$failed deletion(s) failed (see above).${RESET}"
